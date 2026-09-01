@@ -33,6 +33,46 @@ Added `skill://` discovery to VS Code and verified it against the [Hugging Face 
 - Resource templates parsed but not materialized (need the completion API).
 - No `resources/subscribe`, so mid-session skill updates are missed.
 
+## VS Code: SEP-2640 v1 detection over `skills/list` (Issue #66, follow-up)
+
+**Implementation:** [tobi-oye/vscode#1](https://github.com/tobi-oye/vscode/pull/1) (detection) and [#3](https://github.com/tobi-oye/vscode/pull/3) (manifest verification) — same fork as the entry above, re-run against v1 rather than the pre-v1 draft.
+
+**Server:** [olaservo/skills-over-mcp-demo](https://huggingface.co/spaces/olaservo/skills-over-mcp-demo) on a Hugging Face Space, `@olaservo/ext-skills` 0.13.0, tracking SEP-2640 at [`753b9f2`](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640/commits/753b9f2). Streamable HTTP, negotiating `2025-11-25` (VS Code's `LATEST_PROTOCOL_VERSION`).
+
+The earlier entry predates `skills/list`. This one exercises the v1 surface end to end, with one query chosen so no server-side tool could answer it.
+
+**Walkthrough — "what does 5d10dh1 mean?"**
+
+Detection, once per session:
+
+```
+06:48:27  [editor -> server] {"method":"skills/list"}
+06:48:28  [mcp-skills] "ola-skills" served 3 skill(s): tabletop-dice, mcp-glossary, release-notes-writer
+```
+
+`secret-menu` is correctly absent — it is served but unlisted. The model received `name` and `description` only; no skill body was fetched at connect, at listing, or at contribution time.
+
+Retrieval, two hops, only once the model chose to load:
+
+```
+10:03:34  resources/read skill://dice-roller/tabletop-dice/SKILL.md
+10:03:38  resources/read skill://dice-roller/tabletop-dice/references/dice-notation.md
+```
+
+The first read returns a body containing *"see `references/dice-notation.md` for the full grammar"*; the model followed that pointer to the second. The answer — `5d10` rolls five ten-sided dice, `dh1` drops the highest one — comes from the reference file's Keep/Drop table, not from the `SKILL.md`. Both files were verified against the `{uri, digest, size}` manifest carried in the `skills/list` entry from 06:48.
+
+**Findings:**
+
+- **Detection and retrieval separate cleanly in a real host.** The `skills/list` entry carried everything needed to verify content that had not been fetched yet, and nothing was fetched until the model loaded the skill. The on-demand retrieval requirement ([`72cc599`](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640/commits/72cc599)) is implementable without a separate prefetch path — the host simply never has one.
+- **Two-hop reference resolution needed no protocol support.** The relative path inside `SKILL.md` resolved against the skill's `mcp-resource://` base through the existing file service. A skill's supporting files cost nothing extra to reach.
+- **A server-side tool out-competes the skill it is meant to pair with.** The same deployment ships a `roll_dice` tool whose description overlaps `tabletop-dice` almost verbatim. Asked to "roll 2d6+3", the model called the tool and never loaded the skill — with three skills in context and a `BLOCKING REQUIREMENT: … load the relevant skill(s) … as your first action` instruction present and ignored. The tool exists because tool-centric hosts need a `tools/list` surface, and the server's README states it "pairs with the `tabletop-dice` skill without substituting for it"; in this host it substitutes. Only a query the tool provably could not serve (explaining notation rather than executing it) routed through the skill. Related to the *Skill Reliability and Adherence* section below, but with a sharper cause: this is not decay or inattention, it is a matching tool winning against a document.
+- **A directory URI has no read path.** After the two file reads the host issued `resources/read` for `skill://dice-roller`, the parent directory, and got `-32602 Not a skill file`. The server advertises `directoryRead: true`; the host does not implement `resources/directory/read`, so a directory request has nowhere correct to go. Harmless here, but it is a wasted round trip and a user-visible error on an unluckier turn.
+- **No read cache: the same supporting file was fetched six times.** `references/dice-notation.md` was read three times inside the turn that answered the question and three more in later turns. The spec pairs on-demand retrieval with a SHOULD to cache what is retrieved and revalidate against the entry digest. Implementing the first half without the second converts a prefetch problem into a refetch problem, and this ran against a free Hugging Face Space.
+- **A listing was cached for 27 hours across four connections, with no staleness bound in sight.** Exactly one `skills/list` was issued, at 06:48 on 08-30. Discovery reported three skills again at 10:01 and 10:03 on 08-31, over four separate connections, without another wire call. The cause is a cache keyed on the server's *connection state string*: `Stopped → Running` reproduces the key the entry already had, so reconnecting never invalidates it. Two things make this more than a freshness bug. First, verification binds fetched bytes to digests from that cached manifest, so a server redeploying between sessions would have fresh content checked against a stale manifest — and at that point a legitimate update is indistinguishable from tampering. Second, the server sends SEP-2549 `ttlMs`/`cacheScope`, but scopes them to 2026-07-28+ connections; this host negotiates `2025-11-25` and so receives **no** caching guidance at all (confirmed: zero occurrences in the session log). The SEP places no upper bound on how long a host may retain a listing on an older revision, so a host that caches indefinitely is not violating anything. **Worth an explicit note in the SEP:** re-listing on reconnect is the behaviour a server would expect, and nothing currently asks for it.
+- **`skills/get` remained unexercised.** It is reachable only for a skill absent from the listing, and this host has no path that produces such a URI — the server's `instructions` field points at `skill://secret-menu/SKILL.md`, but nothing mines instructions for skill URIs. A host that implements only `skills/list` never calls `skills/get`, and so never discovers that it works.
+
+**Verification:** the demo's own SEP-2640 conformance suite (`smoke-http.ts`) passes against the live deployment, including digest- and size-verified reads. Independently confirmed on the wire: `resultType` is absent from every result — `skills/list`, `skills/get`, `tools/list`, `tools/call`, `resources/read` — while negotiating `2026-07-28`, where the base schema states servers "MUST include this field". Not skills-specific; it applies to every server on the v2 TypeScript SDK, and the same schema instructs clients to treat an absent value as `"complete"`, so nothing breaks today.
+
 ## McpGraph: Skills in MCP Server Repo
 
 **Repo:** [TeamSparkAI/mcpGraph](https://github.com/TeamSparkAI/mcpGraph)
